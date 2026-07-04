@@ -823,7 +823,7 @@ function normalizeConfig(raw: Partial<AppConfig>): AppConfig {
     route,
     joinIntervalMs: asNumber(raw.joinIntervalMs, 1500, 0, 600000),
     joinMaxRetries: asNumber(raw.joinMaxRetries, 2, 0, 10),
-    taskConcurrency: asNumber(raw.taskConcurrency, 1, 1, 10),
+    taskConcurrency: asNumber(raw.taskConcurrency, 1, 1, 50),
     runWorkspaceJoin: asBoolean(raw.runWorkspaceJoin, true),
     runSub2Api: asBoolean(raw.runSub2Api, true),
     sub2apiNoRtMode: asBoolean(raw.sub2apiNoRtMode, false),
@@ -2696,8 +2696,10 @@ async function runOpenAiAuthRequest<T>(
   options: {restartOnInvalidState?: boolean} = {},
 ): Promise<T> {
   const tenant = tenantState();
-  const previous = tenant.openAiAuthQueue || Promise.resolve();
-  const run = previous.catch(() => undefined).then(() => withTenant(tenant, async () => {
+  // 多线程：不再把所有任务的 auth 请求串到单一全局队列里。并发上限由调度器的 taskConcurrency 控制，
+  // 且同一母号+子号共享 root、永不并发（scheduleTasks 的 activeRoots 保证），因此接码不会串号。
+  // 全局节流(waitForOpenAiAuthSpacing)与熔断(waitForOpenAiAuthCircuit)仍保留，作为跨线程的整体限速与退避。
+  return withTenant(tenant, async () => {
     let lastError: unknown;
     for (let attempt = 1; attempt <= OPENAI_AUTH_MAX_ATTEMPTS; attempt += 1) {
       if (task) assertNotCanceled(task);
@@ -2734,12 +2736,7 @@ async function runOpenAiAuthRequest<T>(
       }
     }
     throw lastError instanceof Error ? lastError : new Error(String(lastError || `${label} failed`));
-  }));
-  const queued = run.catch(() => undefined).finally(() => {
-    if (tenant.openAiAuthQueue === queued) tenant.openAiAuthQueue = undefined;
   });
-  tenant.openAiAuthQueue = queued;
-  return run;
 }
 
 function workspaceCircuitKey(workspaceId: string): string {
@@ -4439,12 +4436,34 @@ function mergeCredentials(existing: Record<string, unknown>, accessToken: string
   return next;
 }
 
+// noRT 账号命名：多空间时按 workspace 区分，单空间沿用旧名，与 runK12NoRtPerWorkspace 保持一致。
+function noRtAccountName(email: EmailRecord, workspaceId: string, multi: boolean): string {
+  return multi ? `${email.email}--noRT--${workspaceId}` : `${email.email}--noRT`;
+}
+
+// 逐空间是否成立：目标空间（去掉屏蔽）多于 1 个。
+function isMultiWorkspaceNoRt(task?: K12Task): boolean {
+  const ids = task ? targetK12WorkspaceIds(task) : tenantState().appConfig.workspaceIds;
+  return availableWorkspaceIds(ids).length > 1;
+}
+
+// 该邮箱在 noRT 模式下可能对应的所有账号名（含旧单名 + 每个已配置 workspace 的逐空间名）。
+function perWorkspaceNoRtAccountNames(email: EmailRecord): string[] {
+  const names = [`${email.email}--noRT`];
+  for (const ws of uniqueStringList(tenantState().appConfig.workspaceIds)) {
+    names.push(`${email.email}--noRT--${ws}`);
+  }
+  return names;
+}
+
 function expectedSub2ApiAccountNames(email: EmailRecord, groupName = tenantState().appConfig.sub2apiGroupName || "k12"): string[] {
   const primaryGroupName = primarySub2ApiGroupName(groupName);
+  // email.sub2apiAccount 在逐空间模式下是多个名字用逗号拼接，这里拆开。
+  const stored = asString(email.sub2apiAccount).split(/\s*,\s*/).map((item) => item.trim()).filter(Boolean);
   return Array.from(new Set([
-    asString(email.sub2apiAccount),
+    ...stored,
     `${email.email}---${primaryGroupName}`,
-    `${email.email}--noRT`,
+    ...perWorkspaceNoRtAccountNames(email),
   ].filter(Boolean)));
 }
 
@@ -4630,6 +4649,33 @@ async function findSub2ApiAccountByName(
     if (found) return found;
   }
   return null;
+}
+
+// 返回所有匹配名字的账号（逐空间模式下一个邮箱可能有多个账号），按账号名去重。
+async function findAllSub2ApiAccountsByNames(
+  origin: string,
+  adminToken: string,
+  names: string[],
+): Promise<Record<string, unknown>[]> {
+  const uniqueNames = Array.from(new Set(names.map((item) => item.trim()).filter(Boolean)));
+  const wanted = new Set(uniqueNames.map((item) => item.toLowerCase()));
+  const byName = new Map<string, Record<string, unknown>>();
+  for (const name of uniqueNames) {
+    const data = await requestSub2ApiJson(
+      origin,
+      `/api/v1/admin/accounts?page=1&page_size=20&platform=openai&type=oauth&search=${encodeURIComponent(name)}`,
+      {token: adminToken},
+    );
+    for (const item of extractItems(data)) {
+      if (!item || typeof item !== "object") continue;
+      const account = unwrapSub2ApiAccount(item as Record<string, unknown>);
+      const accountName = sub2ApiAccountName(account);
+      if (wanted.has(accountName.toLowerCase()) && !byName.has(accountName.toLowerCase())) {
+        byName.set(accountName.toLowerCase(), account);
+      }
+    }
+  }
+  return Array.from(byName.values());
 }
 
 function buildQueryString(params: Record<string, string | number | boolean | undefined>): string {
@@ -5209,9 +5255,9 @@ async function checkSub2ApiAccessTokens(body: Record<string, unknown>): Promise<
     const startedAt = Date.now();
     try {
       const names = expectedSub2ApiAccountNames(email, sub2apiGroupName);
-      const account = await findSub2ApiAccountByName(origin, adminToken, names);
-      if (!account) {
-        const message = `Sub2API 未找到账号: ${names.join(" / ")}`;
+      // 逐空间模式下一个邮箱可能有多个账号，逐个测活并分别汇报。
+      const accounts = await findAllSub2ApiAccountsByNames(origin, adminToken, names);
+      if (!accounts.length) {
         items.push({
           emailId: email.id,
           email: email.email,
@@ -5219,47 +5265,52 @@ async function checkSub2ApiAccessTokens(body: Record<string, unknown>): Promise<
           accountId: "",
           ok: false,
           status: 404,
-          message,
+          message: `Sub2API 未找到账号: ${names.join(" / ")}`,
           latencyMs: Date.now() - startedAt,
         });
         continue;
       }
 
-      const accountId = sub2ApiAccountId(account);
-      const accountName = sub2ApiAccountName(account);
-      if (accountName && email.sub2apiAccount !== accountName) {
-        email.sub2apiAccount = accountName;
-        email.updatedAt = nowIso();
-        changedEmails = true;
-      }
-      if (!accountId) {
+      const foundNames: string[] = [];
+      for (const account of accounts) {
+        const perStart = Date.now();
+        const accountId = sub2ApiAccountId(account);
+        const accountName = sub2ApiAccountName(account);
+        if (accountName) foundNames.push(accountName);
+        if (!accountId) {
+          items.push({
+            emailId: email.id,
+            email: email.email,
+            accountName,
+            accountId: "",
+            ok: false,
+            status: 0,
+            message: `Sub2API 账号缺少 id: ${accountName || "(unknown)"}`,
+            latencyMs: Date.now() - perStart,
+          });
+          continue;
+        }
+        const accessToken = extractAccessTokenFromCredentials(sub2ApiAccountCredentials(account));
+        const result = accessToken
+          ? await testOpenAiAccessToken(accessToken)
+          : await testSub2ApiAccountLiveness(origin, adminToken, accountId);
         items.push({
           emailId: email.id,
           email: email.email,
           accountName,
-          accountId: "",
-          ok: false,
-          status: 0,
-          message: `Sub2API 账号缺少 id: ${accountName || "(unknown)"}`,
-          latencyMs: Date.now() - startedAt,
+          accountId,
+          ok: result.ok,
+          status: result.status,
+          message: result.message,
+          latencyMs: result.latencyMs,
         });
-        continue;
       }
-
-      const accessToken = extractAccessTokenFromCredentials(sub2ApiAccountCredentials(account));
-      const result = accessToken
-        ? await testOpenAiAccessToken(accessToken)
-        : await testSub2ApiAccountLiveness(origin, adminToken, accountId);
-      items.push({
-        emailId: email.id,
-        email: email.email,
-        accountName,
-        accountId,
-        ok: result.ok,
-        status: result.status,
-        message: result.message,
-        latencyMs: result.latencyMs,
-      });
+      const joinedNames = foundNames.join(", ");
+      if (joinedNames && email.sub2apiAccount !== joinedNames) {
+        email.sub2apiAccount = joinedNames;
+        email.updatedAt = nowIso();
+        changedEmails = true;
+      }
     } catch (error) {
       items.push({
         emailId: email.id,
@@ -5643,41 +5694,49 @@ async function runK12NoRtPerWorkspace(
   task: K12Task,
   email: EmailRecord,
   accessToken: string,
+  options: {skipJoin?: boolean; workspaceIds?: string[]} = {},
 ): Promise<{accounts: string[]; lastToken: string}> {
-  const workspaceIds = availableWorkspaceIds(targetK12WorkspaceIds(task));
+  // 命名口径基于「任务的全部目标空间」，即使本次只处理其中一个子集（修复场景），账号名也保持一致。
+  const multi = isMultiWorkspaceNoRt(task);
+  const workspaceIds = options.workspaceIds
+    ? availableWorkspaceIds(options.workspaceIds)
+    : availableWorkspaceIds(targetK12WorkspaceIds(task));
   if (!workspaceIds.length) {
     throw new Error("没有可用的 K12 workspace（未配置或全部已被屏蔽）");
   }
   let latestToken = accessToken;
   const accounts: string[] = [];
-  const multi = workspaceIds.length > 1;
 
   for (const workspaceId of workspaceIds) {
     assertNotCanceled(task);
-    if (!hasSuccessfulK12WorkspaceResult(task, workspaceId)) {
-      const result = await sendK12Invite(task, client, latestToken, workspaceId, task.route);
-      task.workspaceResults.push(result);
-      await persistTasks();
-      if (!result.ok) {
-        await maybeBlockWorkspaceOnFailure(task, result);
-        if (multi) await sleep(tenantState().appConfig.joinIntervalMs);
+    try {
+      if (!options.skipJoin && !hasSuccessfulK12WorkspaceResult(task, workspaceId)) {
+        const result = await sendK12Invite(task, client, latestToken, workspaceId, task.route);
+        task.workspaceResults.push(result);
+        await persistTasks();
+        if (!result.ok) {
+          await maybeBlockWorkspaceOnFailure(task, result);
+          continue;
+        }
+      }
+      await checkK12WorkspaceMembership(client, task, latestToken, workspaceId);
+      const workspaceToken = await switchToSpecificK12WorkspaceAccessToken(client, task, latestToken, workspaceId);
+      if (!isAccessTokenForWorkspace(workspaceToken, workspaceId)) {
+        appendLog(task, "warn", `workspace ${workspaceId.slice(0, 8)}... 切换后的 AT 不属于该空间，跳过入库: ${describeAccessTokenContext(workspaceToken)}`);
         continue;
       }
+      latestToken = workspaceToken;
+      recordAccessToken(task, email, latestToken);
+      const accountName = noRtAccountName(email, workspaceId, multi);
+      await upsertSub2ApiNoRtAccountFromAccessToken(task, email, latestToken, accountName);
+      accounts.push(accountName);
+      appendLog(task, "ok", `workspace ${workspaceId.slice(0, 8)}... 已入库 Sub2API: ${accountName}`);
+    } catch (error) {
+      if (task.cancelRequested) throw error;
+      // 单个空间失败不影响其它空间，逐空间隔离。
+      appendLog(task, "warn", `workspace ${workspaceId.slice(0, 8)}... 入库失败，跳过: ${errorText(error)}`);
     }
-    await checkK12WorkspaceMembership(client, task, latestToken, workspaceId);
-    const workspaceToken = await switchToSpecificK12WorkspaceAccessToken(client, task, latestToken, workspaceId);
-    if (!isAccessTokenForWorkspace(workspaceToken, workspaceId)) {
-      appendLog(task, "warn", `workspace ${workspaceId.slice(0, 8)}... 切换后的 AT 不属于该空间，跳过入库: ${describeAccessTokenContext(workspaceToken)}`);
-      if (multi) await sleep(tenantState().appConfig.joinIntervalMs);
-      continue;
-    }
-    latestToken = workspaceToken;
-    recordAccessToken(task, email, latestToken);
-    const accountName = multi ? `${email.email}--noRT--${workspaceId}` : `${email.email}--noRT`;
-    await upsertSub2ApiNoRtAccountFromAccessToken(task, email, latestToken, accountName);
-    accounts.push(accountName);
-    appendLog(task, "ok", `workspace ${workspaceId.slice(0, 8)}... 已入库 Sub2API: ${accountName}`);
-    if (multi) await sleep(tenantState().appConfig.joinIntervalMs);
+    if (workspaceIds.length > 1) await sleep(tenantState().appConfig.joinIntervalMs);
   }
 
   if (!accounts.length) {
@@ -6423,90 +6482,77 @@ async function runAtRepairTask(task: K12Task): Promise<void> {
     const proxy = assertTenantProxyConfigured();
     appendLog(task, "info", `OpenAI 代理已启用: ${maskProxyForLog(proxy.raw)}`);
     const {origin, token: adminToken} = await loginSub2ApiAdmin();
+    const multi = isMultiWorkspaceNoRt(task);
+    const wsIds = availableWorkspaceIds(targetK12WorkspaceIds(task));
     const names = expectedSub2ApiAccountNames(email, task.sub2apiGroupName || tenantState().appConfig.sub2apiGroupName);
-    appendLog(task, "info", `按名称查找 Sub2API 账号: ${names.join(" / ")}`);
-    const account = await findSub2ApiAccountByName(origin, adminToken, names);
-    if (!account) {
-      appendLog(task, "warn", `Sub2API 未找到账号，改为重新获取 K12 AT 后新增账号: ${names.join(" / ")}`);
-      const login = await loginChatGptWebWithFreshSession(task, email);
-      const client = login.client;
-      let newAccessToken = login.accessToken;
-      newAccessToken = await ensureK12AccessTokenForNoRt(client, task, newAccessToken);
-      recordAccessToken(task, email, newAccessToken);
-      await appendTokenOut(newAccessToken);
-      const createdName = await createSub2ApiNoRtAccountFromAccessToken(task, email, newAccessToken);
-      task.sub2apiAccount = createdName;
-      email.sub2apiAccount = createdName;
-      await tryWriteAccountJsonFile(task, email, newAccessToken, {accountName: createdName, source: "gpt-k12-at-repair-create"});
-      task.status = "success";
-      email.status = "success";
-      appendLog(task, "ok", `Sub2API 未有旧账号，已新增账号: ${createdName}`);
+    appendLog(task, "info", `逐空间检查 Sub2API 账号（${wsIds.length} 个空间）: ${names.join(" / ")}`);
+    const existingAccounts = await findAllSub2ApiAccountsByNames(origin, adminToken, names);
+
+    const okAccountNames: string[] = [];
+    const deadWorkspaceIds: string[] = [];
+    let banned = false;
+
+    for (const workspaceId of wsIds) {
+      const wantedName = noRtAccountName(email, workspaceId, multi);
+      const account = existingAccounts.find((item) => sub2ApiAccountName(item).toLowerCase() === wantedName.toLowerCase());
+      if (!account) {
+        appendLog(task, "warn", `workspace ${workspaceId.slice(0, 8)}... 未找到账号 ${wantedName}，将重建`);
+        deadWorkspaceIds.push(workspaceId);
+        continue;
+      }
+      const accountId = sub2ApiAccountId(account);
+      const credentials = sub2ApiAccountCredentials(account);
+      const oldAccessToken = extractAccessTokenFromCredentials(credentials);
+      let alive = false;
+      if (oldAccessToken) {
+        const local = await testOpenAiAccessToken(oldAccessToken);
+        appendLog(task, local.ok ? "ok" : "warn", `${wantedName} AT 在线检验: ${local.message}`);
+        if (local.banned) { banned = true; break; }
+        alive = local.ok;
+      }
+      if (!alive && accountId) {
+        const s = await testSub2ApiAccountLiveness(origin, adminToken, accountId);
+        appendLog(task, s.ok ? "ok" : "warn", `${wantedName} Sub2API 测活: ${s.message}`);
+        alive = s.ok;
+      }
+      if (alive) {
+        okAccountNames.push(wantedName);
+        if (oldAccessToken) {
+          recordAccessToken(task, email, oldAccessToken);
+          await tryWriteAccountJsonFile(task, email, oldAccessToken, {credentials, accountName: wantedName, source: "gpt-k12-at-repair-existing"});
+        }
+      } else {
+        deadWorkspaceIds.push(workspaceId);
+      }
+    }
+
+    if (banned) {
+      markEmailBanned(email, "GPT 账号已被 OpenAI 停用/封禁，停止 AT 修复", task);
+      task.status = "failed";
       return;
     }
 
-    const accountId = sub2ApiAccountId(account);
-    const accountName = sub2ApiAccountName(account);
-    if (!accountId) throw new Error(`Sub2API 账号缺少 id: ${accountName || "(unknown)"}`);
-    task.sub2apiAccount = accountName;
-    email.sub2apiAccount = accountName;
-    appendLog(task, "info", `已找到 Sub2API 账号: ${accountName}#${accountId}`);
-
-    const credentials = sub2ApiAccountCredentials(account);
-    const oldAccessToken = extractAccessTokenFromCredentials(credentials);
-    if (oldAccessToken) {
-      const local = await testOpenAiAccessToken(oldAccessToken);
-      appendLog(task, local.ok ? "ok" : "warn", `当前 AT 在线检验: ${local.message}`);
-      if (local.banned) {
-        markEmailBanned(email, "GPT 账号已被 OpenAI 停用/封禁，停止 AT 修复", task);
-        task.status = "failed";
-        return;
-      }
-      if (local.ok) {
-        recordAccessToken(task, email, oldAccessToken);
-        await tryWriteAccountJsonFile(task, email, oldAccessToken, {
-          credentials,
-          accountName,
-          source: "gpt-k12-at-repair-existing",
-        });
-        task.status = "success";
-        email.status = "success";
-        appendLog(task, "ok", "当前 AT 仍可用，无需更新 Sub2API");
-        return;
-      }
-    } else {
-      appendLog(task, "warn", "Sub2API 账号缺少 credentials.access_token，准备重新获取");
-    }
-
-    const sub2apiTest = await testSub2ApiAccountLiveness(origin, adminToken, accountId);
-    appendLog(task, sub2apiTest.ok ? "ok" : "warn", `Sub2API 账号测活: ${sub2apiTest.message}`);
-    if (sub2apiTest.ok && oldAccessToken) {
-      recordAccessToken(task, email, oldAccessToken);
-      await tryWriteAccountJsonFile(task, email, oldAccessToken, {
-        credentials,
-        accountName,
-        source: "gpt-k12-at-repair-sub2api-ok",
-      });
+    if (!deadWorkspaceIds.length) {
+      task.sub2apiAccount = okAccountNames.join(", ");
+      email.sub2apiAccount = okAccountNames.join(", ");
       task.status = "success";
       email.status = "success";
-      appendLog(task, "ok", "Sub2API 测活通过，无需更新");
+      appendLog(task, "ok", `全部 ${okAccountNames.length} 个空间账号仍可用，无需更新`);
       return;
     }
 
-    appendLog(task, "warn", "AT 不可用，开始重新登录获取新 K12 AT");
+    appendLog(task, "warn", `${deadWorkspaceIds.length} 个空间账号失活/缺失，重新登录后逐空间修复`);
     const login = await loginChatGptWebWithFreshSession(task, email);
-    const client = login.client;
-    let newAccessToken = login.accessToken;
-    newAccessToken = await ensureK12AccessTokenForNoRt(client, task, newAccessToken);
-    recordAccessToken(task, email, newAccessToken);
-    await appendTokenOut(newAccessToken);
-
-    await updateSub2ApiAccountAccessToken(origin, adminToken, account, email, newAccessToken);
-    await tryWriteAccountJsonFile(task, email, newAccessToken, {
-      credentials,
-      accountName,
-      source: "gpt-k12-at-repair-updated",
+    const repaired = await runK12NoRtPerWorkspace(login.client, task, email, login.accessToken, {
+      skipJoin: true,
+      workspaceIds: deadWorkspaceIds,
     });
-    appendLog(task, "ok", `Sub2API 账号 AT 已更新: ${accountName}#${accountId}`);
+    await appendTokenOut(repaired.lastToken);
+    const allNames = Array.from(new Set([...okAccountNames, ...repaired.accounts]));
+    task.sub2apiAccount = allNames.join(", ");
+    email.sub2apiAccount = allNames.join(", ");
+    await tryWriteAccountJsonFile(task, email, repaired.lastToken, {accountName: allNames.join(", "), source: "gpt-k12-at-repair-updated"});
+    appendLog(task, "ok", `AT 修复完成：仍可用 ${okAccountNames.length}，已修复 ${repaired.accounts.length}`);
     task.status = "success";
     email.status = "success";
   } catch (error) {
@@ -7098,7 +7144,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): P
   if (method === "POST" && pathname === "/api/emails/split") {
     const body = await readJsonBody(req);
     const ids = Array.isArray(body.ids) ? body.ids.map((item) => String(item)).filter(Boolean) : [];
-    const count = asNumber(body.count, 4, 1, 50);
+    const count = asNumber(body.count, 6, 1, 50);
     if (!ids.length) {
       sendJson(res, 400, {error: "请选择至少一个母邮箱"});
       return;
@@ -7138,7 +7184,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): P
     try {
       const body = await readJsonBody(req);
       if (body.concurrency !== undefined) {
-        await saveConfig(normalizeConfig({...tenantState().appConfig, taskConcurrency: asNumber(body.concurrency, tenantState().appConfig.taskConcurrency, 1, 10)}));
+        await saveConfig(normalizeConfig({...tenantState().appConfig, taskConcurrency: asNumber(body.concurrency, tenantState().appConfig.taskConcurrency, 1, 50)}));
       }
       const result = await createTasks(body);
       sendJson(res, 201, {

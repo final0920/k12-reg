@@ -279,8 +279,8 @@
                   </select>
                 </label>
                 <label class="field">
-                  <span>并发</span>
-                  <input v-model.number="form.taskConcurrency" type="number" min="1" max="10" />
+                  <span>并发（线程数，同一母号+子号仍串行）</span>
+                  <input v-model.number="form.taskConcurrency" type="number" min="1" max="50" />
                 </label>
                 <label class="field">
                   <span>间隔 ms</span>
@@ -651,7 +651,7 @@
                 修复AT {{ selectedRepairableEmailIds.length }}
               </button>
               <button class="ghost small" :disabled="!selectedEmailIds.length" @click="splitSelectedEmails">
-                分裂选中 x{{ splitAliasCount || 4 }}
+                分裂选中 x{{ splitAliasCount || 6 }}
               </button>
               <button class="danger small" :disabled="!selectedEmailIds.length" @click="deleteSelectedEmails">
                 删除选中 {{ selectedEmailIds.length }}
@@ -1019,7 +1019,7 @@ const selectedTaskIds = ref<string[]>([]);
 const taskPageSize = 50;
 const taskPage = ref(1);
 const dataImportInput = ref<HTMLInputElement | null>(null);
-const splitAliasCount = ref(4);
+const splitAliasCount = ref(6);
 const workspaceText = ref("");
 const runCount = ref(1);
 const toast = ref("");
@@ -1551,7 +1551,7 @@ function selectParentEmails() {
 
 async function splitSelectedEmails() {
   if (!selectedEmailIds.value.length) return;
-  const count = Math.max(1, Math.min(50, Number(splitAliasCount.value) || 4));
+  const count = Math.max(1, Math.min(50, Number(splitAliasCount.value) || 6));
   const ok = window.confirm(`确认将选中的 ${selectedEmailIds.value.length} 个邮箱按每个 ${count} 个子邮箱分裂？子邮箱会复用母邮箱接码地址。`);
   if (!ok) return;
   const result = await api<any>("/api/emails/split", {
