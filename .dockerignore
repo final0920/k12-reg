@@ -1,0 +1,13 @@
+node_modules
+dist
+data
+json
+.git
+.gitignore
+*.log
+pool_tokens.txt
+config.json
+codex_register/node_modules
+codex_register/bundle
+**/._*
+*.bak.*
