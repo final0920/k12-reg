@@ -615,10 +615,9 @@ function resolveTenantOutputPath(configured: string, fallback: string): string {
   return resolved === root || resolved.startsWith(root + path.sep) ? resolved : fallback;
 }
 
-function tenantIdFromRequest(req: IncomingMessage): string {
-  const header = req.headers["x-k12-tenant-id"];
-  const raw = Array.isArray(header) ? header[0] : header;
-  return sanitizeTenantId(raw);
+function tenantIdFromRequest(_req: IncomingMessage): string {
+  // 单用户模式：不再按浏览器区分租户，所有请求共用同一份配置/邮箱池/任务（data/ 默认库）。
+  return "default";
 }
 
 function createTenantRuntime(id: string): TenantRuntime {
